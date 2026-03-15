@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  devbox — Per-project persistent Docker dev environments
+#
+#  Usage:
+#    devbox                  Start/attach to container for current directory
+#    devbox list             List all devbox containers
+#    devbox stop [name]      Stop a container (default: current project)
+#    devbox rm [name]        Remove a container and its volumes
+#    devbox build            Rebuild the devbox image
+#    devbox status           Show current project's container status
+# ==============================================================================
+
+set -euo pipefail
+
+readonly DEVBOX_VERSION="1.0.0"
+readonly DEVBOX_STATE_DIR="${HOME}/.local/share/devbox"
+readonly DEVBOX_CONFIG_DIR="${HOME}/.config/devbox"
+readonly DEVBOX_IMAGE="devbox:latest"
+
+# ── Default port ranges (common dev servers) ──────────────────────────
+# Not bound by default — use `devbox -p 3000` or `devbox -p web` to expose
+readonly WEB_PORTS="3000-3010:3000-3010 5173-5175:5173-5175 8080:8080 24678:24678"
+readonly API_PORTS="4000-4005:4000-4005 8082-8090:8082-8090"
+readonly EXPO_PORTS="8081:8081 19000-19006:19000-19006"
+readonly ALL_PORTS="${WEB_PORTS} ${API_PORTS} ${EXPO_PORTS}"
+
+# ── Colors ────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    DIM=$'\033[2m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' DIM='' BOLD='' RESET=''
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+die() { printf "${RED}error:${RESET} %s\n" "$*" >&2; exit 1; }
+info() { printf "${BLUE}::${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}warn:${RESET} %s\n" "$*" >&2; }
+success() { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+
+# Derive a container name from a project directory path
+# Uses basename + short hash of full path to avoid collisions
+# e.g. /Users/charlie/code/river-journal → dev-river-journal-a3f1
+#      /Users/charlie/work/river-journal → dev-river-journal-c7b2
+project_name_from_dir() {
+    local dir="${1:-$(pwd)}"
+    basename "$dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
+}
+
+path_hash() {
+    local dir="${1:-$(pwd)}"
+    local hash
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$dir" | md5sum | cut -c1-4)"
+    else
+        hash="$(printf '%s' "$dir" | md5 | cut -c1-4)"
+    fi
+    printf '%s' "$hash"
+}
+
+container_name_from_dir() {
+    local dir="${1:-$(pwd)}"
+    printf "dev-%s-%s" "$(project_name_from_dir "$dir")" "$(path_hash "$dir")"
+}
+
+# Check if a container exists (running or stopped)
+container_exists() {
+    docker container inspect "$1" >/dev/null 2>&1
+}
+
+# Check if a container is running
+container_running() {
+    local state
+    state="$(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" || return 1
+    [[ "$state" == "true" ]]
+}
+
+# Get the Dockerfile path (installed location or repo location)
+get_dockerfile_path() {
+    local locations=(
+        "${DEVBOX_CONFIG_DIR}/Dockerfile"
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/Dockerfile"
+    )
+    for loc in "${locations[@]}"; do
+        if [[ -f "$loc" ]]; then
+            printf '%s' "$loc"
+            return 0
+        fi
+    done
+    die "Dockerfile not found. Run the installer or set DEVBOX_CONFIG_DIR."
+}
+
+# Ensure the devbox image is built
+ensure_image() {
+    if docker image inspect "$DEVBOX_IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+    info "Building devbox image (first time setup)..."
+    cmd_build
+}
+
+# Seed Claude settings into shared auth volume (once)
+seed_claude_settings() {
+    local marker="${DEVBOX_STATE_DIR}/.claude-seeded"
+    if [[ -f "$marker" ]]; then
+        return 0
+    fi
+    docker run --rm -v devbox-claude-auth:/claude-auth "$DEVBOX_IMAGE" \
+        bash -c 'cat > /claude-auth/settings.json << '\''EOF'\''
+{
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
+chown '"$(id -u):$(id -g)"' /claude-auth/settings.json'
+    touch "$marker"
+}
+
+# Store project metadata
+save_project_meta() {
+    local name="$1" dir="$2"
+    local meta_dir="${DEVBOX_STATE_DIR}/projects/${name}"
+    mkdir -p "$meta_dir"
+    printf '%s' "$dir" > "${meta_dir}/path"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "${meta_dir}/last_used"
+}
+
+# Read stored project path for a container
+get_project_path() {
+    local name="$1"
+    local meta_file="${DEVBOX_STATE_DIR}/projects/${name}/path"
+    if [[ -f "$meta_file" ]]; then
+        cat "$meta_file"
+    fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────
+
+cmd_start() {
+    local project_dir
+    project_dir="$(pwd)"
+    local name
+    name="$(container_name_from_dir "$project_dir")"
+    local project
+    project="$(project_name_from_dir "$project_dir")"
+
+    # Parse port flags
+    local requested_ports=()
+    shift_count=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p)
+                if [[ -z "${2:-}" ]]; then
+                    die "-p requires an argument (port, range, or preset: web, api, expo, all)"
+                fi
+                case "$2" in
+                    web)  read -ra _p <<< "$WEB_PORTS"; requested_ports+=("${_p[@]}") ;;
+                    api)  read -ra _p <<< "$API_PORTS"; requested_ports+=("${_p[@]}") ;;
+                    expo) read -ra _p <<< "$EXPO_PORTS"; requested_ports+=("${_p[@]}") ;;
+                    all)  read -ra _p <<< "$ALL_PORTS"; requested_ports+=("${_p[@]}") ;;
+                    *)    requested_ports+=("$2:$2") ;;
+                esac
+                shift 2
+                ;;
+            *)  die "Unknown option: $1" ;;
+        esac
+    done
+
+    # Ensure Docker is running
+    if ! docker info >/dev/null 2>&1; then
+        die "Docker is not running. Start Docker Desktop and try again."
+    fi
+
+    ensure_image
+    seed_claude_settings
+
+    # Container already running — just attach
+    if container_running "$name"; then
+        info "Attaching to running container ${BOLD}${name}${RESET}"
+        save_project_meta "$name" "$project_dir"
+        exec docker exec -it "$name" bash
+    fi
+
+    # Container exists but stopped — start it
+    if container_exists "$name"; then
+        info "Starting stopped container ${BOLD}${name}${RESET}"
+        docker start "$name" >/dev/null
+        save_project_meta "$name" "$project_dir"
+        exec docker exec -it "$name" bash
+    fi
+
+    # Create new container
+    info "Creating container ${BOLD}${name}${RESET} for ${CYAN}${project_dir}${RESET}"
+
+    local port_args=()
+    for mapping in "${requested_ports[@]}"; do
+        port_args+=("-p" "$mapping")
+    done
+
+    local volume_args=(
+        # Project directory → /home/dev/workspace
+        -v "${project_dir}:/home/dev/workspace"
+        # Shared volume — Claude auth persists across all projects
+        -v "devbox-claude-auth:/home/dev/.claude"
+        # Per-project persistent volumes
+        -v "${name}-cursor-ext:/home/dev/.cursor-server"
+        -v "${name}-cache:/home/dev/.cache"
+    )
+
+    # SSH keys (read-only, if they exist)
+    if [[ -d "${HOME}/.ssh" ]]; then
+        volume_args+=(-v "${HOME}/.ssh:/home/dev/.ssh:ro")
+    fi
+
+    # Git config (read-only)
+    if [[ -f "${HOME}/.gitconfig" ]]; then
+        volume_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
+    fi
+
+    local env_args=(
+        -e "TERM=xterm-256color"
+        -e "NODE_ENV=development"
+        -e "DEVBOX_PROJECT=${project}"
+    )
+
+    # Forward Anthropic API key if set
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        env_args+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+    fi
+
+    # Forward .env file if it exists in the project
+    local env_file_args=()
+    if [[ -f "${project_dir}/.env" ]]; then
+        env_file_args+=(--env-file "${project_dir}/.env")
+    fi
+
+    docker run -d \
+        --name "$name" \
+        --hostname "$project" \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop ALL \
+        --cap-add CHOWN \
+        --cap-add DAC_OVERRIDE \
+        --security-opt no-new-privileges:true \
+        --add-host "host.docker.internal:host-gateway" \
+        --restart unless-stopped \
+        ${port_args[@]+"${port_args[@]}"} \
+        "${volume_args[@]}" \
+        "${env_args[@]}" \
+        ${env_file_args[@]+"${env_file_args[@]}"} \
+        "$DEVBOX_IMAGE" \
+        sleep infinity >/dev/null
+
+    save_project_meta "$name" "$project_dir"
+    success "Container ${BOLD}${name}${RESET} created"
+    exec docker exec -it "$name" bash
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        name="$(container_name_from_dir)"
+    fi
+
+    if ! container_exists "$name"; then
+        die "Container '${name}' does not exist"
+    fi
+
+    if ! container_running "$name"; then
+        warn "Container '${name}' is already stopped"
+        return 0
+    fi
+
+    docker stop "$name" >/dev/null
+    success "Stopped ${BOLD}${name}${RESET}"
+}
+
+cmd_rm() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        name="$(container_name_from_dir)"
+    fi
+
+    if ! container_exists "$name"; then
+        die "Container '${name}' does not exist"
+    fi
+
+    # Stop if running
+    if container_running "$name"; then
+        docker stop "$name" >/dev/null
+    fi
+
+    docker rm "$name" >/dev/null
+
+    # Ask about volumes
+    printf "Remove persistent volumes for ${BOLD}%s${RESET}? [y/N] " "$name"
+    read -r answer
+    if [[ "$answer" =~ ^[Yy] ]]; then
+        docker volume rm "${name}-cursor-ext" "${name}-cache" 2>/dev/null || true
+        success "Removed container and volumes for ${BOLD}${name}${RESET}"
+        info "Shared Claude auth volume (devbox-claude-auth) preserved"
+    else
+        success "Removed container ${BOLD}${name}${RESET} (volumes preserved)"
+    fi
+
+    # Clean up state
+    rm -rf "${DEVBOX_STATE_DIR}/projects/${name}"
+}
+
+cmd_list() {
+    local containers
+    containers="$(docker ps -a --filter 'name=^dev-' --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null)"
+
+    if [[ -z "$containers" ]]; then
+        info "No devbox containers found"
+        return 0
+    fi
+
+    printf "${BOLD}%-25s %-30s %s${RESET}\n" "CONTAINER" "STATUS" "PROJECT PATH"
+    printf "%-25s %-30s %s\n" "─────────" "──────" "────────────"
+
+    while IFS=$'\t' read -r name status _ports; do
+        local path
+        path="$(get_project_path "$name")"
+        if [[ -z "$path" ]]; then
+            path="${DIM}(unknown)${RESET}"
+        fi
+
+        # Color status
+        local colored_status
+        if [[ "$status" == *"Up"* ]]; then
+            colored_status="${GREEN}${status}${RESET}"
+        else
+            colored_status="${DIM}${status}${RESET}"
+        fi
+
+        printf "%-25s %-30b %b\n" "$name" "$colored_status" "$path"
+    done <<< "$containers"
+}
+
+cmd_status() {
+    local name
+    name="$(container_name_from_dir)"
+
+    if ! container_exists "$name"; then
+        info "No container for this project (${BOLD}${name}${RESET})"
+        return 0
+    fi
+
+    docker inspect "$name" --format \
+        "Container:  {{.Name}}
+State:      {{.State.Status}}
+Created:    {{.Created}}
+Image:      {{.Config.Image}}
+Mounts:     {{range .Mounts}}
+  {{.Type}}: {{.Source}} → {{.Destination}}{{end}}" 2>/dev/null | sed 's|^/||'
+}
+
+cmd_build() {
+    local dockerfile
+    dockerfile="$(get_dockerfile_path)"
+    local context_dir
+    context_dir="$(dirname "$dockerfile")"
+
+    info "Building devbox image from ${DIM}${dockerfile}${RESET}"
+    docker build \
+        -t "$DEVBOX_IMAGE" \
+        --build-arg "USER_ID=$(id -u)" \
+        --build-arg "GROUP_ID=$(id -g)" \
+        -f "$dockerfile" \
+        "$context_dir"
+    success "Image ${BOLD}${DEVBOX_IMAGE}${RESET} built"
+}
+
+cmd_help() {
+    cat <<'EOF'
+devbox — Per-project persistent Docker dev environments
+
+Usage:
+    devbox                  Start/attach to container for current directory
+    devbox -p <port|preset> Expose ports when creating a container
+    devbox list             List all devbox containers
+    devbox stop [name]      Stop a container (default: current project)
+    devbox rm [name]        Remove a container and its volumes
+    devbox build            Rebuild the devbox image
+    devbox status           Show current project's container status
+    devbox help             Show this help
+
+Port presets:
+    -p 3000                 Expose a single port
+    -p web                  Next.js, Vite, general HTTP (3000-3010, 5173-5175, 8080)
+    -p api                  API servers (4000-4005, 8082-8090)
+    -p expo                 Expo/React Native (8081, 19000-19006)
+    -p all                  All of the above
+    -p 3000 -p 5173         Multiple individual ports
+
+How it works:
+    cd into any project directory and run `devbox`. A persistent Docker
+    container is created with only that project mounted. Each project
+    gets isolated volumes for Cursor extensions and caches. Claude auth
+    is shared across all projects.
+
+    No ports are exposed by default (Cursor attached-container mode
+    doesn't need them). Use -p to expose ports when running dev servers.
+
+    Container names are derived from the directory name: dev-{project}-{hash}.
+    Containers persist across restarts (use `devbox rm` to clean up).
+
+Examples:
+    cd ~/code/my-api && devbox             # Start (no ports)
+    cd ~/code/my-app && devbox -p web      # Start with web ports
+    devbox list                             # See all project containers
+    devbox stop                             # Stop current project's container
+    devbox rm dev-old-project-a3f1          # Remove a specific container
+EOF
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+mkdir -p "$DEVBOX_STATE_DIR" "$DEVBOX_CONFIG_DIR"
+
+case "${1:-}" in
+    list|ls)    cmd_list ;;
+    stop)       cmd_stop "${2:-}" ;;
+    rm|remove)  cmd_rm "${2:-}" ;;
+    build)      cmd_build ;;
+    status|st)  cmd_status ;;
+    help|-h|--help) cmd_help ;;
+    version|-v|--version) printf "devbox %s\n" "$DEVBOX_VERSION" ;;
+    -p)         cmd_start "$@" ;;
+    "")         cmd_start ;;
+    *)          die "Unknown command: $1 (try 'devbox help')" ;;
+esac

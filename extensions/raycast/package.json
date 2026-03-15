@@ -1,0 +1,48 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "devbox",
+  "title": "Devbox",
+  "description": "Manage per-project Docker dev containers and open them in Cursor",
+  "icon": "command-icon.png",
+  "author": "charlie",
+  "license": "MIT",
+  "preferences": [
+    {
+      "name": "defaultEditor",
+      "title": "Default Editor",
+      "description": "Which editor to open when you press Enter",
+      "type": "dropdown",
+      "required": false,
+      "default": "cursor",
+      "data": [
+        { "title": "Cursor", "value": "cursor" },
+        { "title": "Antigravity", "value": "antigravity" },
+        { "title": "Claude Code (Terminal)", "value": "claude" }
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "name": "index",
+      "title": "Devbox",
+      "subtitle": "Project Containers",
+      "description": "List, start, stop, and open project dev containers",
+      "mode": "view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.93.2"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "@types/node": "22.13.14",
+    "@types/react": "19.0.12",
+    "eslint": "^9.22.0",
+    "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}
