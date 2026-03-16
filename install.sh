@@ -63,6 +63,20 @@ cp "${REPO_DIR}/build/Dockerfile" "${CONFIG_DIR}/Dockerfile"
 
 success "Installed devbox to ${BIN_DIR}/devbox"
 
+# ── Install zsh completions ─────────────────────────────────────────
+COMP_DIR="${HOME}/.local/share/devbox/completions"
+mkdir -p "$COMP_DIR"
+cp "${REPO_DIR}/completions/_devbox" "$COMP_DIR/_devbox"
+
+# Add completion to .zshrc if not already present
+COMP_LINE='fpath=(${HOME}/.local/share/devbox/completions $fpath)'
+if [[ -f "${HOME}/.zshrc" ]] && ! grep -qF '.local/share/devbox/completions' "${HOME}/.zshrc" 2>/dev/null; then
+    printf '\n# devbox completions\n%s\nautoload -Uz compinit && compinit\n' "$COMP_LINE" >> "${HOME}/.zshrc"
+    success "Added zsh completions (restart your shell or run: source ~/.zshrc)"
+else
+    success "Zsh completions installed"
+fi
+
 # ── Check PATH ───────────────────────────────────────────────────────
 if ! echo "$PATH" | tr ':' '\n' | grep -q "${BIN_DIR}"; then
     printf "\n"

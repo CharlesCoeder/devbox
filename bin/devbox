@@ -300,9 +300,9 @@ cmd_rm() {
     docker rm "$name" >/dev/null
 
     # Ask about volumes
-    printf "Remove persistent volumes for ${BOLD}%s${RESET}? [y/N] " "$name"
+    printf "Remove persistent volumes for ${BOLD}%s${RESET}? [Y/n] " "$name"
     read -r answer
-    if [[ "$answer" =~ ^[Yy] ]]; then
+    if [[ ! "$answer" =~ ^[Nn] ]]; then
         docker volume rm "${name}-cursor-ext" "${name}-cache" 2>/dev/null || true
         success "Removed container and volumes for ${BOLD}${name}${RESET}"
         info "Shared Claude auth volume (devbox-claude-auth) preserved"

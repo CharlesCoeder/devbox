@@ -127,6 +127,19 @@ function stopContainer(name: string): boolean {
 function removeContainer(name: string): boolean {
   try {
     execSync(`${DOCKER_PATH} rm -f ${name}`, { timeout: 15000 });
+    // Remove persistent volumes
+    try {
+      execSync(`${DOCKER_PATH} volume rm ${name}-cursor-ext ${name}-cache 2>/dev/null`, {
+        timeout: 10000,
+      });
+    } catch {
+      // Volumes may not exist — that's fine
+    }
+    // Clean up project metadata
+    const metaDir = join(STATE_DIR, name);
+    if (existsSync(metaDir)) {
+      execSync(`rm -rf "${metaDir}"`);
+    }
     return true;
   } catch {
     return false;

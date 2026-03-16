@@ -1,0 +1,39 @@
+#compdef devbox
+# ==============================================================================
+#  Zsh completion for devbox
+# ==============================================================================
+
+_devbox_containers() {
+    local -a containers
+    containers=(${(f)"$(docker ps -a --filter 'name=^dev-' --format '{{.Names}}' 2>/dev/null)"})
+    _describe 'container' containers
+}
+
+_devbox() {
+    local -a commands
+    commands=(
+        'list:List all devbox containers'
+        'ls:List all devbox containers'
+        'stop:Stop a container'
+        'rm:Remove a container and its volumes'
+        'remove:Remove a container and its volumes'
+        'build:Rebuild the devbox image'
+        'status:Show current project container status'
+        'st:Show current project container status'
+        'help:Show help'
+        'version:Show version'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        rm|remove|stop)
+            _devbox_containers
+            ;;
+    esac
+}
+
+_devbox "$@"
